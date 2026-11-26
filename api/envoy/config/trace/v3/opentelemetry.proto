@@ -22,7 +22,7 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 
 // Configuration for the OpenTelemetry tracer.
 //  [#extension: envoy.tracers.opentelemetry]
-// [#next-free-field: 13]
+// [#next-free-field: 14]
 message OpenTelemetryConfig {
   // Trace context formats that can be extracted from downstream requests and injected into
   // upstream requests.
@@ -141,4 +141,36 @@ message OpenTelemetryConfig {
   // Each format may be listed at most once. If not specified, the default is ``[TRACE_CONTEXT]``.
   repeated TraceContextFormat outgoing_trace_context = 12
       [(validate.rules).repeated = {items {enum {defined_only: true}}}];
+
+  // Whether to honor the sampling decision of a valid parent span context extracted from the
+  // downstream request when Envoy did not select the request for tracing.
+  //
+  // If false or not set (the default), Envoy's tracing decision is final: a request that is not
+  // traced by Envoy is not sampled, even if the parent span context is sampled.
+  //
+  // If true, a request that, in this Envoy's tracing decision, was not selected by
+  // :ref:`random_sampling <envoy_v3_api_field_extensions.filters.network.http_connection_manager.v3.HttpConnectionManager.Tracing.random_sampling>`
+  // and that passes
+  // :ref:`overall_sampling <envoy_v3_api_field_extensions.filters.network.http_connection_manager.v3.HttpConnectionManager.Tracing.overall_sampling>`
+  // is sampled if its parent span context is sampled. If a
+  // :ref:`sampler <envoy_v3_api_field_config.trace.v3.OpenTelemetryConfig.sampler>` is configured,
+  // the sampler must also sample it. A parent span context that is not sampled is never overridden.
+  // The span is still not sampled when the request is rejected by ``overall_sampling``, when it
+  // carries :ref:`x-client-trace-id <config_http_conn_man_headers_x-client-trace-id>` but is
+  // rejected by
+  // :ref:`client_sampling <envoy_v3_api_field_extensions.filters.network.http_connection_manager.v3.HttpConnectionManager.Tracing.client_sampling>`,
+  // and when the request ID is missing or invalid. Requests without a parent span context are not
+  // affected. A request ID marked as not traced by a previous hop does not record why, so such a
+  // request is evaluated as if it had not been traced yet.
+  //
+  // Requests that are identified as health checks only after the span is started, such as by the
+  // :ref:`health check filter <config_http_filters_health_check>`, are not distinguished from
+  // other requests by this field.
+  //
+  // The decision is made when the span is started. As for any span that follows its parent's
+  // sampling decision, a later route refresh does not change it. When
+  // :ref:`use_request_id_for_trace_sampling <envoy_v3_api_field_extensions.request_id.uuid.v3.UuidRequestIdConfig.use_request_id_for_trace_sampling>`
+  // is false, Envoy traces every request and does not apply ``overall_sampling``, so this field has
+  // no effect.
+  google.protobuf.BoolValue honor_parent_sampling_decision = 13;
 }

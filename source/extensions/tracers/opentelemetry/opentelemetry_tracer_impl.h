@@ -50,6 +50,7 @@ private:
   ThreadLocal::SlotSharedPtr tls_slot_ptr_;
   OpenTelemetryTracerStats tracing_stats_;
   const TraceContextFormats incoming_trace_context_;
+  const bool honor_parent_sampling_decision_;
 };
 
 } // namespace OpenTelemetry

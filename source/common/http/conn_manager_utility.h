@@ -132,11 +132,15 @@ public:
 
   /**
    * Mutate request headers if request needs to be traced.
+   * @param parent_sampling_allowed if not null, set to true only if, in this evaluation, random
+   *        sampling did not select the request, client sampling did not reject it and it passes
+   *        overall sampling. See Tracing::Decision::parent_sampling_allowed.
    * @return the trace reason selected after header mutation to be stored in stream info.
    */
   ABSL_MUST_USE_RESULT static Tracing::Reason
   mutateTracingRequestHeader(RequestHeaderMap& request_headers, Runtime::Loader& runtime,
-                             ConnectionManagerConfig& config, const Router::Route* route);
+                             ConnectionManagerConfig& config, const Router::Route* route,
+                             bool* parent_sampling_allowed = nullptr);
 
 private:
   static void appendXff(RequestHeaderMap& request_headers, Network::Connection& connection,

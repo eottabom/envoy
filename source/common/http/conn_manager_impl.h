@@ -497,6 +497,8 @@ private:
     DownstreamFilterManager filter_manager_;
 
     Tracing::SpanPtr active_span_;
+    // See Tracing::Decision::parent_sampling_allowed.
+    bool tracing_parent_sampling_allowed_{false};
     ResponseEncoder* response_encoder_{};
     Stats::TimespanPtr request_response_timespan_;
     // Per-stream idle timeout. This timer gets reset whenever activity occurs on the stream, and,

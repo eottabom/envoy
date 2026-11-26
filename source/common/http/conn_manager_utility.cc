@@ -393,7 +393,10 @@ void ConnectionManagerUtility::cleanInternalHeaders(
 
 Tracing::Reason ConnectionManagerUtility::mutateTracingRequestHeader(
     RequestHeaderMap& request_headers, Runtime::Loader& runtime, ConnectionManagerConfig& config,
-    const Router::Route* route) {
+    const Router::Route* route, bool* parent_sampling_allowed) {
+  if (parent_sampling_allowed != nullptr) {
+    *parent_sampling_allowed = false;
+  }
   Tracing::Reason final_reason = Tracing::Reason::NotTraceable;
   if (!config.tracingConfig()) {
     return final_reason;
@@ -426,6 +429,7 @@ Tracing::Reason ConnectionManagerUtility::mutateTracingRequestHeader(
 
   // Do not apply tracing transformations if we are currently tracing.
   final_reason = rid_extension->getTraceReason(request_headers);
+  bool not_selected_by_random_sampling = false;
   if (Tracing::Reason::NotTraceable == final_reason) {
     if (request_headers.ClientTraceId() &&
         runtime.snapshot().featureEnabled("tracing.client_enabled", *client_sampling)) {
@@ -438,6 +442,10 @@ Tracing::Reason ConnectionManagerUtility::mutateTracingRequestHeader(
                                                  result)) {
       final_reason = Tracing::Reason::Sampling;
       rid_extension->setTraceReason(request_headers, final_reason);
+    } else {
+      // A request that asked for client tracing and was rejected by client sampling is an explicit
+      // rejection, not just a request that random sampling did not select.
+      not_selected_by_random_sampling = request_headers.ClientTraceId() == nullptr;
     }
   }
 
@@ -445,6 +453,12 @@ Tracing::Reason ConnectionManagerUtility::mutateTracingRequestHeader(
       !runtime.snapshot().featureEnabled("tracing.global_enabled", *overall_sampling, result)) {
     final_reason = Tracing::Reason::NotTraceable;
     rid_extension->setTraceReason(request_headers, final_reason);
+  }
+
+  if (not_selected_by_random_sampling && parent_sampling_allowed != nullptr) {
+    // Overall sampling still bounds a sampling decision propagated by the downstream.
+    *parent_sampling_allowed =
+        runtime.snapshot().featureEnabled("tracing.global_enabled", *overall_sampling, result);
   }
 
   return final_reason;

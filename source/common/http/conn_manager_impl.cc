@@ -1804,7 +1804,7 @@ void ConnectionManagerImpl::ActiveStream::decodeHeaders(RequestHeaderMapSharedPt
     filter_manager_.streamInfo().setTraceReason(
         ConnectionManagerUtility::mutateTracingRequestHeader(
             *request_headers_, connection_manager_.runtime_, *connection_manager_.config_,
-            cached_route_.value().get()));
+            cached_route_.value().get(), &tracing_parent_sampling_allowed_));
   }
 
   filter_manager_.streamInfo().setRequestHeaders(*request_headers_);
@@ -1858,8 +1858,10 @@ void ConnectionManagerImpl::ActiveStream::decodeHeaders(RequestHeaderMapSharedPt
 void ConnectionManagerImpl::ActiveStream::traceRequest() {
   ASSERT(connection_manager_tracing_config_.has_value());
 
-  const Tracing::Decision tracing_decision =
+  Tracing::Decision tracing_decision =
       Tracing::TracerUtility::shouldTraceRequest(filter_manager_.streamInfo());
+  tracing_decision.parent_sampling_allowed =
+      tracing_decision.reason == Tracing::Reason::NotTraceable && tracing_parent_sampling_allowed_;
 
   Tracing::HttpTraceContext trace_context(*request_headers_);
   active_span_ = connection_manager_.tracer().startSpan(
@@ -2094,7 +2096,7 @@ void ConnectionManagerImpl::ActiveStream::refreshTracing() {
   // refreshing.
   const auto trace_reason = ConnectionManagerUtility::mutateTracingRequestHeader(
       *request_headers_, connection_manager_.runtime_, *connection_manager_.config_,
-      cached_route_.value().get());
+      cached_route_.value().get(), &tracing_parent_sampling_allowed_);
   filter_manager_.streamInfo().setTraceReason(trace_reason);
   const Tracing::Decision tracing_decision =
       Tracing::TracerUtility::shouldTraceRequest(filter_manager_.streamInfo());

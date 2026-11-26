@@ -185,6 +185,24 @@ envoy_extension_cc_test(
 )
 
 envoy_extension_cc_test(
+    name = "honor_parent_sampling_decision_integration_test",
+    srcs = ["honor_parent_sampling_decision_integration_test.cc"],
+    extension_names = ["envoy.tracers.opentelemetry"],
+    rbe_pool = {
+        "gcc": {"build": "linux_x64_small"},
+        "openssl": {"link": "linux_x64_small"},
+        "coverage": {"link": "linux_x64_large"},
+        "tsan": {"link": "linux_x64_small"},
+    },
+    deps = [
+        "//source/extensions/tracers/opentelemetry:config",
+        "//test/integration:http_integration_lib",
+        "//test/test_common:utility_lib",
+        "@envoy_api//envoy/extensions/filters/network/http_connection_manager/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_extension_cc_test(
     name = "http_trace_exporter_integration_test",
     srcs = ["http_trace_exporter_integration_test.cc"],
     extension_names = ["envoy.tracers.opentelemetry"],

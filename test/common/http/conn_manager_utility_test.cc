@@ -2399,6 +2399,145 @@ TEST_F(ConnectionManagerUtilityTest, RandomSamplingWhenGlobalSet) {
   EXPECT_EQ(Tracing::Reason::Sampling, request_id_extension_->getTraceReason(request_headers));
 }
 
+// Parent sampling is only allowed for requests that random sampling did not select and that pass
+// overall sampling.
+TEST_F(ConnectionManagerUtilityTest, ParentSamplingAllowedOnlyAfterRandomSamplingMiss) {
+  struct TestCase {
+    bool random_sampled;
+    bool overall_sampled;
+    Tracing::Reason expected_reason;
+    bool expected_allowed;
+  };
+  const std::vector<TestCase> test_cases = {
+      {true, true, Tracing::Reason::Sampling, false},
+      {true, false, Tracing::Reason::NotTraceable, false},
+      {false, true, Tracing::Reason::NotTraceable, true},
+      {false, false, Tracing::Reason::NotTraceable, false},
+  };
+  for (const auto& test_case : test_cases) {
+    EXPECT_CALL(runtime_.snapshot_,
+                featureEnabled("tracing.random_sampling",
+                               An<const envoy::type::v3::FractionalPercent&>(), _))
+        .WillOnce(Return(test_case.random_sampled));
+    EXPECT_CALL(runtime_.snapshot_,
+                featureEnabled("tracing.global_enabled",
+                               An<const envoy::type::v3::FractionalPercent&>(), _))
+        .WillOnce(Return(test_case.overall_sampled));
+
+    Http::TestRequestHeaderMapImpl request_headers{
+        {"x-request-id", "125a4afb-6f55-44ba-ad80-413f09f48a28"}};
+    bool parent_sampling_allowed = !test_case.expected_allowed;
+    EXPECT_EQ(test_case.expected_reason,
+              ConnectionManagerUtility::mutateTracingRequestHeader(
+                  request_headers, runtime_, config_, &route_, &parent_sampling_allowed));
+    EXPECT_EQ(test_case.expected_allowed, parent_sampling_allowed);
+  }
+}
+
+// A request ID marked as not traceable by a previous hop does not record why, so the request is
+// evaluated again like a request that was not traced yet.
+TEST_F(ConnectionManagerUtilityTest, ParentSamplingForRequestIdMarkedNotTraceableByPreviousHop) {
+  Http::TestRequestHeaderMapImpl request_headers{
+      {"x-request-id", "125a4afb-6f55-44ba-ad80-413f09f48a28"}};
+  request_id_extension_->setTraceReason(request_headers, Tracing::Reason::NotTraceable);
+  ASSERT_EQ(Tracing::Reason::NotTraceable, request_id_extension_->getTraceReason(request_headers));
+
+  EXPECT_CALL(
+      runtime_.snapshot_,
+      featureEnabled("tracing.random_sampling", An<const envoy::type::v3::FractionalPercent&>(), _))
+      .WillOnce(Return(false));
+  EXPECT_CALL(
+      runtime_.snapshot_,
+      featureEnabled("tracing.global_enabled", An<const envoy::type::v3::FractionalPercent&>(), _))
+      .WillOnce(Return(true));
+  bool parent_sampling_allowed = false;
+  EXPECT_EQ(Tracing::Reason::NotTraceable,
+            ConnectionManagerUtility::mutateTracingRequestHeader(
+                request_headers, runtime_, config_, &route_, &parent_sampling_allowed));
+  EXPECT_TRUE(parent_sampling_allowed);
+}
+
+// A request with x-client-trace-id that is rejected by client sampling is an explicit rejection,
+// even if random sampling did not select it either.
+TEST_F(ConnectionManagerUtilityTest, ParentSamplingNotAllowedAfterClientSamplingRejection) {
+  EXPECT_CALL(runtime_.snapshot_, featureEnabled("tracing.client_enabled",
+                                                 An<const envoy::type::v3::FractionalPercent&>()))
+      .WillOnce(Return(false));
+  EXPECT_CALL(
+      runtime_.snapshot_,
+      featureEnabled("tracing.random_sampling", An<const envoy::type::v3::FractionalPercent&>(), _))
+      .WillOnce(Return(false));
+  EXPECT_CALL(
+      runtime_.snapshot_,
+      featureEnabled("tracing.global_enabled", An<const envoy::type::v3::FractionalPercent&>(), _))
+      .Times(0);
+
+  Http::TestRequestHeaderMapImpl request_headers{
+      {"x-request-id", "125a4afb-6f55-44ba-ad80-413f09f48a28"},
+      {"x-client-trace-id", "f4dca0a9-12c7-4307-8002-969403baf480"}};
+  bool parent_sampling_allowed = true;
+  EXPECT_EQ(Tracing::Reason::NotTraceable,
+            ConnectionManagerUtility::mutateTracingRequestHeader(
+                request_headers, runtime_, config_, &route_, &parent_sampling_allowed));
+  EXPECT_FALSE(parent_sampling_allowed);
+}
+
+// Without a usable request ID no sampling decision is computed, so parent sampling is not
+// allowed.
+TEST_F(ConnectionManagerUtilityTest, ParentSamplingNotAllowedWithoutValidRequestId) {
+  EXPECT_CALL(
+      runtime_.snapshot_,
+      featureEnabled("tracing.global_enabled", An<const envoy::type::v3::FractionalPercent&>(), _))
+      .Times(0);
+  for (const auto& request_id : std::vector<std::string>{"", "not-a-uuid"}) {
+    Http::TestRequestHeaderMapImpl request_headers;
+    if (!request_id.empty()) {
+      request_headers.setRequestId(request_id);
+    }
+    bool parent_sampling_allowed = true;
+    EXPECT_EQ(Tracing::Reason::NotTraceable,
+              ConnectionManagerUtility::mutateTracingRequestHeader(
+                  request_headers, runtime_, config_, &route_, &parent_sampling_allowed));
+    EXPECT_FALSE(parent_sampling_allowed);
+  }
+}
+
+// When the request ID is not used for sampling, every request is traced and overall sampling is
+// not applied, so parent sampling is not needed.
+TEST_F(ConnectionManagerUtilityTest, ParentSamplingNotAllowedWithoutRequestIdSampling) {
+  EXPECT_CALL(*request_id_extension_, useRequestIdForTraceSampling()).WillOnce(Return(false));
+  EXPECT_CALL(
+      runtime_.snapshot_,
+      featureEnabled("tracing.global_enabled", An<const envoy::type::v3::FractionalPercent&>(), _))
+      .Times(0);
+
+  Http::TestRequestHeaderMapImpl request_headers{
+      {"x-request-id", "125a4afb-6f55-44ba-ad80-413f09f48a28"}};
+  bool parent_sampling_allowed = true;
+  EXPECT_EQ(Tracing::Reason::Sampling,
+            ConnectionManagerUtility::mutateTracingRequestHeader(
+                request_headers, runtime_, config_, &route_, &parent_sampling_allowed));
+  EXPECT_FALSE(parent_sampling_allowed);
+}
+
+// Without the optional output, overall sampling is not evaluated for requests that were not
+// selected by any sampling check, as before.
+TEST_F(ConnectionManagerUtilityTest, OverallSamplingNotEvaluatedWithoutOutput) {
+  EXPECT_CALL(
+      runtime_.snapshot_,
+      featureEnabled("tracing.random_sampling", An<const envoy::type::v3::FractionalPercent&>(), _))
+      .WillOnce(Return(false));
+  EXPECT_CALL(
+      runtime_.snapshot_,
+      featureEnabled("tracing.global_enabled", An<const envoy::type::v3::FractionalPercent&>(), _))
+      .Times(0);
+
+  Http::TestRequestHeaderMapImpl request_headers{
+      {"x-request-id", "125a4afb-6f55-44ba-ad80-413f09f48a28"}};
+  EXPECT_EQ(Tracing::Reason::NotTraceable, ConnectionManagerUtility::mutateTracingRequestHeader(
+                                               request_headers, runtime_, config_, &route_));
+}
+
 TEST_F(ConnectionManagerUtilityTest, SamplingWithoutRouteOverride) {
   EXPECT_CALL(
       runtime_.snapshot_,

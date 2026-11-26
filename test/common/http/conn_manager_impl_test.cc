@@ -1756,6 +1756,94 @@ TEST_F(HttpConnectionManagerImplTest, StartAndFinishSpanAndTraceDecisionRefreshA
   EXPECT_EQ(1UL, tracing_stats_.not_traceable_.value());
 }
 
+// Verifies the Tracing::Decision::parent_sampling_allowed flag that the HCM passes to the tracer.
+class HttpConnectionManagerImplParentSamplingTest : public HttpConnectionManagerImplTest {
+protected:
+  Tracing::Decision startSpanAndCaptureDecision(bool random_sampled, bool overall_sampled) {
+    setup(SetupOpts().setTracing(true));
+
+    std::shared_ptr<MockStreamDecoderFilter> filter(new NiceMock<MockStreamDecoderFilter>());
+    EXPECT_CALL(filter_factory_, createFilterChain(_))
+        .WillRepeatedly([&](FilterChainFactoryCallbacks& callbacks) -> bool {
+          auto factory = createDecoderFilterFactoryCb(filter);
+          callbacks.setFilterConfigName("");
+          factory(callbacks);
+          return true;
+        });
+
+    // Treat request as internal, otherwise x-request-id header will be overwritten.
+    use_remote_address_ = false;
+    EXPECT_CALL(random_, uuid()).Times(0);
+
+    EXPECT_CALL(runtime_.snapshot_,
+                featureEnabled("tracing.random_sampling",
+                               An<const envoy::type::v3::FractionalPercent&>(), _))
+        .WillOnce(Return(random_sampled));
+    EXPECT_CALL(runtime_.snapshot_,
+                featureEnabled("tracing.global_enabled",
+                               An<const envoy::type::v3::FractionalPercent&>(), _))
+        .WillOnce(Return(overall_sampled));
+
+    Tracing::Decision captured{Tracing::Reason::Sampling, true, true};
+    auto* span = new NiceMock<Tracing::MockSpan>();
+    EXPECT_CALL(*tracer_, startSpan_(_, _, _, _))
+        .WillOnce([&](const Tracing::Config&, Tracing::TraceContext&,
+                      const StreamInfo::StreamInfo&,
+                      const Tracing::Decision decision) -> Tracing::Span* {
+          captured = decision;
+          return span;
+        });
+    EXPECT_CALL(*span, finishSpan());
+
+    EXPECT_CALL(*codec_, dispatch(_)).WillRepeatedly([&](Buffer::Instance& data) -> Http::Status {
+      decoder_ = &conn_manager_->newStream(response_encoder_);
+
+      // The trace status encoded in this request ID is "not traced", so random sampling runs.
+      RequestHeaderMapPtr headers{
+          new TestRequestHeaderMapImpl{{":method", "GET"},
+                                       {":authority", "host"},
+                                       {":path", "/"},
+                                       {"x-request-id", "125a4afb-6f55-44ba-ad80-413f09f48a28"}}};
+      decoder_->decodeHeaders(std::move(headers), true);
+
+      ResponseHeaderMapPtr response_headers{new TestResponseHeaderMapImpl{{":status", "200"}}};
+      filter->callbacks_->streamInfo().setResponseCodeDetails("");
+      filter->callbacks_->encodeHeaders(std::move(response_headers), true, "details");
+      data.drain(4);
+      return Http::okStatus();
+    });
+
+    Buffer::OwnedImpl fake_input("1234");
+    conn_manager_->onData(fake_input, false);
+    return captured;
+  }
+};
+
+// A request that random sampling did not select and that passes overall sampling allows the tracer
+// to honor the parent's sampling decision.
+TEST_F(HttpConnectionManagerImplParentSamplingTest, AllowedWhenOnlyNotSelectedByRandomSampling) {
+  const Tracing::Decision decision = startSpanAndCaptureDecision(false, true);
+  EXPECT_EQ(Tracing::Reason::NotTraceable, decision.reason);
+  EXPECT_FALSE(decision.traced);
+  EXPECT_TRUE(decision.parent_sampling_allowed);
+}
+
+// Overall sampling still bounds the parent's sampling decision.
+TEST_F(HttpConnectionManagerImplParentSamplingTest, NotAllowedWhenRejectedByOverallSampling) {
+  const Tracing::Decision decision = startSpanAndCaptureDecision(false, false);
+  EXPECT_EQ(Tracing::Reason::NotTraceable, decision.reason);
+  EXPECT_FALSE(decision.traced);
+  EXPECT_FALSE(decision.parent_sampling_allowed);
+}
+
+// A request that Envoy traces does not need the parent's decision.
+TEST_F(HttpConnectionManagerImplParentSamplingTest, NotAllowedWhenSelectedByRandomSampling) {
+  const Tracing::Decision decision = startSpanAndCaptureDecision(true, true);
+  EXPECT_EQ(Tracing::Reason::Sampling, decision.reason);
+  EXPECT_TRUE(decision.traced);
+  EXPECT_FALSE(decision.parent_sampling_allowed);
+}
+
 TEST_F(HttpConnectionManagerImplTest, StartAndFinishSpanAndTraceDecisionRefreshAndNotUseDecision) {
   setup(SetupOpts().setTracing(true));
 

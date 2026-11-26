@@ -134,7 +134,9 @@ Driver::Driver(const envoy::config::trace::v3::OpenTelemetryConfig& opentelemetr
       tracing_stats_{OPENTELEMETRY_TRACER_STATS(
           POOL_COUNTER_PREFIX(context.serverFactoryContext().scope(), "tracing.opentelemetry"))},
       incoming_trace_context_(toTraceContextFormats(opentelemetry_config.incoming_trace_context(),
-                                                    "incoming_trace_context")) {
+                                                    "incoming_trace_context")),
+      honor_parent_sampling_decision_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(
+          opentelemetry_config, honor_parent_sampling_decision, false)) {
   auto& factory_context = context.serverFactoryContext();
 
   ResourceProviderOptions options;
@@ -289,9 +291,18 @@ Tracing::SpanPtr Driver::startSpan(const Tracing::Config& config,
       malformed_trace_context = true;
       continue;
     }
-    return applyTracingDecision(tracer.startSpan(operation_name, stream_info,
-                                                 stream_info.startTime(), span_context->value(),
-                                                 trace_context, span_kind));
+    const SpanContext& parent_context = span_context->value();
+    Tracing::SpanPtr span = tracer.startSpan(operation_name, stream_info, stream_info.startTime(),
+                                             parent_context, trace_context, span_kind);
+    if (honor_parent_sampling_decision_ && parent_context.sampled() &&
+        tracing_decision.reason == Tracing::Reason::NotTraceable &&
+        tracing_decision.parent_sampling_allowed) {
+      // Random sampling did not select the request and nothing in this Envoy rejected it, so a
+      // sampled parent is honored. A configured sampler can still drop the span, but it cannot
+      // sample a span whose parent is not sampled.
+      return span;
+    }
+    return applyTracingDecision(std::move(span));
   }
   if (malformed_trace_context) {
     // Trace context was present but could not be extracted, so the request is not traced.

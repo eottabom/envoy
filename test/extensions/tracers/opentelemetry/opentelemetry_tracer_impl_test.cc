@@ -167,6 +167,51 @@ public:
     setup(opentelemetry_config);
   }
 
+  void setupValidDriverHonoringParentSamplingDecision() {
+    const std::string yaml_string = R"EOF(
+    grpc_service:
+      envoy_grpc:
+        cluster_name: fake-cluster
+      timeout: 0.250s
+    honor_parent_sampling_decision: true
+    )EOF";
+    envoy::config::trace::v3::OpenTelemetryConfig opentelemetry_config;
+    TestUtility::loadFromYaml(yaml_string, opentelemetry_config);
+
+    setup(opentelemetry_config);
+  }
+
+  void setupValidDriverWithAlwaysOnSamplerHonoringParentSamplingDecision() {
+    const std::string yaml_string = R"EOF(
+    grpc_service:
+      envoy_grpc:
+        cluster_name: fake-cluster
+      timeout: 0.250s
+    sampler:
+      name: envoy.tracers.opentelemetry.samplers.always_on
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.tracers.opentelemetry.samplers.v3.AlwaysOnSamplerConfig
+    honor_parent_sampling_decision: true
+    )EOF";
+    envoy::config::trace::v3::OpenTelemetryConfig opentelemetry_config;
+    TestUtility::loadFromYaml(yaml_string, opentelemetry_config);
+
+    setup(opentelemetry_config);
+  }
+
+  // Starts a span for a request with the given traceparent (or none if empty) and returns
+  // whether the span is sampled.
+  bool startSpanAndGetSampled(const std::string& traceparent, Tracing::Decision decision) {
+    Tracing::TestTraceContextImpl request_headers{
+        {":authority", "test.com"}, {":path", "/"}, {":method", "GET"}};
+    if (!traceparent.empty()) {
+      request_headers.set("traceparent", traceparent);
+    }
+    Tracing::SpanPtr span = driver_->startSpan(mock_tracing_config_, request_headers, stream_info_,
+                                               operation_name_, decision);
+    return dynamic_cast<Span*>(span.get())->sampled();
+  }
+
   void setupValidDriverWithCustomExporter() {
     const std::string yaml_string = R"EOF(
     exporter:
@@ -2049,6 +2094,93 @@ TEST_F(OpenTelemetryDriverTest, UseLocalDecisionFalse) {
   EXPECT_CALL(*mock_client_, sendRaw(_, _, _, _, _, _)).Times(0);
   span->finishSpan();
   EXPECT_EQ(0U, stats_.counter("tracing.opentelemetry.spans_sent").value());
+}
+
+constexpr absl::string_view SampledParentTraceparent =
+    "00-00000000000000010000000000000002-0000000000000003-01";
+constexpr absl::string_view NotSampledParentTraceparent =
+    "00-00000000000000010000000000000002-0000000000000003-00";
+// The decision for a request that random sampling did not select and that passed overall sampling.
+const Tracing::Decision NotSelectedByRandomSampling{Tracing::Reason::NotTraceable, false, true};
+
+// By default the Envoy tracing decision is final, even when parent sampling is allowed.
+TEST_F(OpenTelemetryDriverTest, HonorParentSamplingDecisionDisabledByDefault) {
+  setupValidDriver();
+  EXPECT_FALSE(
+      startSpanAndGetSampled(std::string(SampledParentTraceparent), NotSelectedByRandomSampling));
+}
+
+// A sampled parent is honored when the request was only not selected by random sampling.
+TEST_F(OpenTelemetryDriverTest, HonorParentSamplingDecisionSampledParent) {
+  setupValidDriverHonoringParentSamplingDecision();
+  Tracing::TestTraceContextImpl request_headers{
+      {":authority", "test.com"},
+      {":path", "/"},
+      {":method", "GET"},
+      {"traceparent", std::string(SampledParentTraceparent)}};
+  Tracing::SpanPtr span = driver_->startSpan(mock_tracing_config_, request_headers, stream_info_,
+                                             operation_name_, NotSelectedByRandomSampling);
+  EXPECT_FALSE(span->useLocalDecision());
+  EXPECT_TRUE(dynamic_cast<Span*>(span.get())->sampled());
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("tracing.opentelemetry.min_flush_spans", 5U))
+      .WillOnce(Return(1));
+  EXPECT_CALL(*mock_client_, sendRaw(_, _, _, _, _, _));
+  span->finishSpan();
+  EXPECT_EQ(1U, stats_.counter("tracing.opentelemetry.spans_sent").value());
+}
+
+// A parent decision not to sample is honored.
+TEST_F(OpenTelemetryDriverTest, HonorParentSamplingDecisionNotSampledParent) {
+  setupValidDriverHonoringParentSamplingDecision();
+  EXPECT_FALSE(startSpanAndGetSampled(std::string(NotSampledParentTraceparent),
+                                      NotSelectedByRandomSampling));
+  EXPECT_FALSE(startSpanAndGetSampled(std::string(NotSampledParentTraceparent),
+                                      {Tracing::Reason::Sampling, true}));
+}
+
+// Explicit rejections (overall sampling, client sampling, invalid request ID) do not allow parent
+// sampling, so a sampled parent is still rejected.
+TEST_F(OpenTelemetryDriverTest, HonorParentSamplingDecisionNotAllowed) {
+  setupValidDriverHonoringParentSamplingDecision();
+  EXPECT_FALSE(startSpanAndGetSampled(std::string(SampledParentTraceparent),
+                                      {Tracing::Reason::NotTraceable, false, false}));
+}
+
+// The driver only honors the parent for Reason::NotTraceable, even if the flag is set. The HCM does
+// not set the flag for other reasons; this guards the driver against such a decision.
+TEST_F(OpenTelemetryDriverTest, HonorParentSamplingDecisionRequiresNotTraceableReason) {
+  setupValidDriverHonoringParentSamplingDecision();
+  EXPECT_FALSE(startSpanAndGetSampled(std::string(SampledParentTraceparent),
+                                      {Tracing::Reason::HealthCheck, false, true}));
+}
+
+// Requests without a parent keep using the Envoy tracing decision.
+TEST_F(OpenTelemetryDriverTest, HonorParentSamplingDecisionWithoutParent) {
+  setupValidDriverHonoringParentSamplingDecision();
+  EXPECT_FALSE(startSpanAndGetSampled("", NotSelectedByRandomSampling));
+  EXPECT_TRUE(startSpanAndGetSampled("", {Tracing::Reason::Sampling, true}));
+}
+
+// A sampler cannot sample a span whose parent is not sampled, even when the parent is honored.
+TEST_F(OpenTelemetryDriverTest, HonorParentSamplingDecisionWithSamplerNotSampledParent) {
+  setupValidDriverWithAlwaysOnSamplerHonoringParentSamplingDecision();
+  EXPECT_FALSE(startSpanAndGetSampled(std::string(NotSampledParentTraceparent),
+                                      NotSelectedByRandomSampling));
+}
+
+// A sampled parent is honored when the configured sampler also samples the span.
+TEST_F(OpenTelemetryDriverTest, HonorParentSamplingDecisionWithSamplerSampledParent) {
+  setupValidDriverWithAlwaysOnSamplerHonoringParentSamplingDecision();
+  EXPECT_TRUE(
+      startSpanAndGetSampled(std::string(SampledParentTraceparent), NotSelectedByRandomSampling));
+}
+
+// Without parent sampling allowed, the sampler's decision is still vetoed by Envoy.
+TEST_F(OpenTelemetryDriverTest, HonorParentSamplingDecisionWithSamplerNotAllowed) {
+  setupValidDriverWithAlwaysOnSamplerHonoringParentSamplingDecision();
+  EXPECT_FALSE(startSpanAndGetSampled(std::string(SampledParentTraceparent),
+                                      {Tracing::Reason::NotTraceable, false, false}));
 }
 
 TEST_F(OpenTelemetryDriverTest, RootSpanWithAlwaysOnSamplerStillHonorsEnvoyDecision) {
